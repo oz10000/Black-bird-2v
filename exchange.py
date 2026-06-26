@@ -298,3 +298,14 @@ class Exchange:
         params = {"instId": instrument, "mgnMode": "cross"}
         telemetry.log_debug("exchange", f"Consultando leverage para {instrument}")
         return self._request_with_retry("GET", "/api/v5/account/leverage-info", params=params)
+
+    # ------------------------------------------------------------
+    # Consulta de órdenes pendientes (market/limit)
+    # ------------------------------------------------------------
+    def get_pending_orders(self, symbol: Optional[str] = None) -> Dict:
+        if not self._connected:
+            return {"ok": False, "error": "No conectado"}
+        params = {}
+        if symbol:
+            params["instId"] = self._instrument_id(symbol)
+        return self._request_with_retry("GET", "/api/v5/trade/orders-pending", params=params)
