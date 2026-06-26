@@ -1,7 +1,7 @@
 # main.py
 # ============================================================
 # BOT PRINCIPAL – ORQUESTADOR CON SOPORTE MULTIESTRATEGIA
-# VERSIÓN CON set_leverage EN LA CONEXIÓN
+# VERSIÓN CON OPTIMIZACIONES DE FRECUENCIA, TIEMPO Y MONITOR
 # ============================================================
 
 import os
@@ -76,12 +76,18 @@ class Bot:
         self.error_count = 0
         self.max_errors = MAX_CONSECUTIVE_ERRORS
         self.running = True
-        self.cycle_interval = CYCLE_INTERVAL_TEST if TEST_MODE else 60
+        self.cycle_interval = CYCLE_INTERVAL if not TEST_MODE else CYCLE_INTERVAL_TEST
         self.state_data = load_state()
-        telemetry.log_info("main", f"Bot inicializado (modo: {'TEST' if TEST_MODE else 'PRODUCCIÓN'})")
+        self.start_time = time.time()
+        telemetry.log_info("main", f"Bot inicializado (modo: {'TEST' if TEST_MODE else 'PRODUCCIÓN'}) | ciclo={self.cycle_interval}s")
 
     def run(self):
         while self.running:
+            # Verificar tiempo máximo de ejecución
+            if time.time() - self.start_time > MAX_RUNTIME_SECONDS:
+                telemetry.log_info("main", "Tiempo máximo de ejecución alcanzado, apagando bot")
+                self.state = BotState.SHUTDOWN
+
             try:
                 self._step()
                 if self.state == BotState.SHUTDOWN:
@@ -131,13 +137,11 @@ class Bot:
         self.exchange = Exchange(self.api_key, self.secret_key, self.passphrase, self.demo)
         if self.exchange.connect():
             self.error_count = 0
-            # 🔥 NUEVO: Establecer apalancamiento para todos los símbolos
             for symbol in SYMBOLS:
                 try:
                     result = self.exchange.set_leverage(symbol, LEVERAGE)
                     if result.get('ok'):
                         telemetry.log_info("main", f"Apalancamiento {LEVERAGE}x establecido para {symbol}")
-                        # Confirmar (opcional, para logging)
                         confirm = self.exchange.get_leverage_info(symbol)
                         if confirm.get('ok'):
                             lever = confirm.get('data', [{}])[0].get('lever', 'N/A')
@@ -174,7 +178,14 @@ class Bot:
                 self.position.mark_price = float(pos_data['markPx'])
                 self.position.unrealized_pnl = float(pos_data['upl'])
             telemetry.log_info("main", f"Posición activa: {self.position.symbol} {self.position.side} | PnL: {self.position.unrealized_pnl:.2f}")
-            self.state = BotState.WAIT_NEXT_CYCLE
+            # Llamar a monitor_position para gestionar la posición
+            monitor_result = monitor_position(self.exchange, self.position)
+            telemetry.log_info("main", f"Monitoreo completado: {monitor_result}")
+            # Si el monitor decide cerrar la posición (por tiempo, estancamiento, TP dinámico, etc.)
+            if monitor_result.get('close'):
+                self._close_position()
+            else:
+                self.state = BotState.WAIT_NEXT_CYCLE
         else:
             self.position = None
             self.state = BotState.SEARCH_SIGNAL
@@ -186,13 +197,11 @@ class Bot:
             self.state = BotState.WAIT_NEXT_CYCLE
             return
 
-        # Verificar que no haya posición abierta
         if self.position is not None:
             telemetry.log_info("main", f"Posición activa ({self.position.symbol}), no se abrirán nuevas posiciones")
             self.state = BotState.WAIT_NEXT_CYCLE
             return
 
-        # Verificar órdenes pendientes (market orders en curso)
         try:
             pending_orders = self.exchange.get_pending_orders()
             if pending_orders.get('ok') and pending_orders.get('data'):
@@ -220,9 +229,6 @@ class Bot:
     def _open_position(self):
         telemetry.log_info("main", f"Abriendo posición: {self.signal.symbol} {self.signal.direction}")
 
-        # ============================================================
-        # 1. Consultar balance disponible
-        # ============================================================
         balance_resp = self.exchange.get_balance()
         if not balance_resp.get('ok'):
             telemetry.log_error("main", "No se pudo obtener balance", balance_resp)
@@ -243,9 +249,6 @@ class Bot:
 
         telemetry.log_info("main", f"Balance disponible: {usdt_balance:.2f} USDT")
 
-        # ============================================================
-        # 2. Obtener parámetros del instrumento (ctVal, lotSz)
-        # ============================================================
         symbol = self.signal.symbol
         params = INSTRUMENT_PARAMS.get(symbol, {'ctVal': 1.0, 'lotSz': 0.01, 'minSz': 0.01})
         ct_val = params['ctVal']
@@ -254,45 +257,28 @@ class Bot:
 
         telemetry.log_info("main", f"ctVal={ct_val}, lotSz={lot_sz}, minSz={min_sz} para {symbol}")
 
-        # ============================================================
-        # 3. Calcular notional con leverage y ctVal
-        # ============================================================
         safety_factor = 0.98
         available_capital = usdt_balance * safety_factor
         telemetry.log_info("main", f"Capital utilizable: {available_capital:.2f} USDT")
 
-        # Notional deseado = capital disponible * leverage
         desired_notional = available_capital * LEVERAGE
         telemetry.log_info("main", f"Notional deseado: {desired_notional:.2f} USDT (leverage {LEVERAGE}x)")
 
-        # Tamaño en contratos = notional / (precio * ctVal)
         size = desired_notional / (self.signal.entry_price * ct_val)
-
-        # Redondear al múltiplo de lotSz
         if lot_sz > 0:
             size = round(size / lot_sz) * lot_sz
         else:
             size = round(size)
-
-        # Asegurar mínimo
         if size < min_sz:
             size = min_sz
-
-        # Asegurar que no sea cero
         if size < min_sz:
             size = min_sz
-
-        # Redondear a 2 decimales para evitar problemas de precisión
         size = round(size, 2)
 
         actual_notional = size * self.signal.entry_price * ct_val
-
         telemetry.log_info("main", f"Tamaño ajustado: {size} contratos (notional real ~{actual_notional:.2f} USDT)")
         telemetry.log_info("main", f"Valor nominal enviado a la API: {actual_notional:.2f} USDT")
 
-        # ============================================================
-        # 4. Enviar orden
-        # ============================================================
         side = "buy" if self.signal.direction == "Long" else "sell"
 
         order = self.exchange.place_market_order(self.signal.symbol, side, size)
@@ -331,9 +317,7 @@ class Bot:
             repair_attempts=0
         )
 
-        # ============================================================
-        # 5. Enviar TP/SL
-        # ============================================================
+        # Enviar TP/SL
         if self.signal.target_price and self.signal.stop_loss:
             if self.position.side == 'long':
                 tp_side, sl_side = 'sell', 'sell'
@@ -380,9 +364,7 @@ class Bot:
                 else:
                     telemetry.log_error("main", "Fallo al enviar trailing", trail_resp)
 
-        # ============================================================
-        # 6. Guardar estado
-        # ============================================================
+        # Guardar estado
         self.state_data['trades'].append({
             'symbol': self.position.symbol,
             'side': self.position.side,
@@ -398,6 +380,20 @@ class Bot:
         save_state(self.state_data)
 
         self.state = BotState.WAIT_NEXT_CYCLE
+
+    def _close_position(self):
+        """Cierra la posición actual (market order en contra)."""
+        if self.position is None:
+            return
+        telemetry.log_info("main", f"Cerrando posición: {self.position.symbol} {self.position.side}")
+        side = "sell" if self.position.side == "long" else "buy"
+        close_resp = self.exchange.place_market_order(self.position.symbol, side, self.position.size)
+        if close_resp.get('ok'):
+            telemetry.log_info("main", "Posición cerrada exitosamente", close_resp)
+            self.position = None
+        else:
+            telemetry.log_error("main", "Fallo al cerrar posición", close_resp)
+            self.state = BotState.ERROR_RECOVERY
 
     def _wait_next_cycle(self):
         telemetry.log_info("main", "Esperando siguiente ciclo...")
