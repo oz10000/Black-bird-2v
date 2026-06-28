@@ -21,7 +21,7 @@ ATR_PERIOD = 14
 BE_GAIN = 0.0005
 BE_UMBRAL = 0.25
 
-# ---- Trailing Stop ----
+# ---- Trailing Stop (Phase 1: activado por defecto) ----
 TRAILING_ENABLED = True
 TRAILING_MODE = 'native'
 TRAILING_DISTANCE_ATR = 0.6
@@ -134,7 +134,7 @@ MAX_REPAIR_ATTEMPTS = 3
 # ---- Control de Riesgo ----
 MAX_DAILY_LOSS_PERCENT = 2.0
 MAX_WEEKLY_LOSS_PERCENT = 4.0
-MAX_OPEN_POSITIONS = 1
+MAX_OPEN_POSITIONS = 1  # ⚠️ PHASE 1: SOLO UNA POSICIÓN A LA VEZ
 
 # ---- Backtesting ----
 BACKTEST_DAYS = 5
@@ -193,7 +193,8 @@ if __name__ == "__main__":
         'MAX_POSITION_HOLD_MINUTES', 'CLOSE_IF_STALLED',
         'TP_DYNAMIC', 'TRAILING_ADAPTIVE', 'CYCLE_INTERVAL',
         'BACKTEST_DAYS', 'LOG_DIR',
-        'TEST_MODE', 'ACTIVE_STRATEGY', 'STRATEGY_MODULES'
+        'TEST_MODE', 'ACTIVE_STRATEGY', 'STRATEGY_MODULES',
+        'TRAILING_ENABLED', 'TRAILING_MODE', 'TRAILING_DISTANCE_ATR'
     ]
     all_ok = True
     for var in required:
