@@ -1,7 +1,8 @@
 # main.py
 # ============================================================
 # BOT PRINCIPAL – ORQUESTADOR CON SOPORTE MULTIESTRATEGIA
-# VERSIÓN CON OPTIMIZACIONES DE FRECUENCIA, TIEMPO Y MONITOR
+# VERSIÓN OPTIMIZADA CON SISTEMA DE PROTECCIÓN SIMPLIFICADO (PHASE 1)
+# BASADO EN EL POSITION MANAGER PARA CONSISTENCIA DE API
 # ============================================================
 
 import os
@@ -83,7 +84,6 @@ class Bot:
 
     def run(self):
         while self.running:
-            # Verificar tiempo máximo de ejecución
             if time.time() - self.start_time > MAX_RUNTIME_SECONDS:
                 telemetry.log_info("main", "Tiempo máximo de ejecución alcanzado, apagando bot")
                 self.state = BotState.SHUTDOWN
@@ -178,10 +178,8 @@ class Bot:
                 self.position.mark_price = float(pos_data['markPx'])
                 self.position.unrealized_pnl = float(pos_data['upl'])
             telemetry.log_info("main", f"Posición activa: {self.position.symbol} {self.position.side} | PnL: {self.position.unrealized_pnl:.2f}")
-            # Llamar a monitor_position para gestionar la posición
             monitor_result = monitor_position(self.exchange, self.position)
             telemetry.log_info("main", f"Monitoreo completado: {monitor_result}")
-            # Si el monitor decide cerrar la posición (por tiempo, estancamiento, TP dinámico, etc.)
             if monitor_result.get('close'):
                 self._close_position()
             else:
@@ -229,6 +227,17 @@ class Bot:
     def _open_position(self):
         telemetry.log_info("main", f"Abriendo posición: {self.signal.symbol} {self.signal.direction}")
 
+        # 🔒 SAFETY GATE: Doble verificación de que no exista posición antes de la orden
+        fresh_pos = self.exchange.get_positions()
+        if fresh_pos.get('ok') and fresh_pos.get('data'):
+            telemetry.log_warning(
+                "main",
+                f"Posición activa encontrada ({len(fresh_pos['data'])}), abortando apertura para evitar duplicado."
+            )
+            self.signal = None
+            self.state = BotState.WAIT_NEXT_CYCLE
+            return
+
         balance_resp = self.exchange.get_balance()
         if not balance_resp.get('ok'):
             telemetry.log_error("main", "No se pudo obtener balance", balance_resp)
@@ -271,8 +280,6 @@ class Bot:
             size = round(size)
         if size < min_sz:
             size = min_sz
-        if size < min_sz:
-            size = min_sz
         size = round(size, 2)
 
         actual_notional = size * self.signal.entry_price * ct_val
@@ -281,6 +288,7 @@ class Bot:
 
         side = "buy" if self.signal.direction == "Long" else "sell"
 
+        # 1. Orden de mercado (sin protecciones)
         order = self.exchange.place_market_order(self.signal.symbol, side, size)
         if not order.get('ok'):
             telemetry.log_error("main", "Fallo al abrir posición", order)
@@ -317,52 +325,50 @@ class Bot:
             repair_attempts=0
         )
 
-        # Enviar TP/SL
-        if self.signal.target_price and self.signal.stop_loss:
-            if self.position.side == 'long':
-                tp_side, sl_side = 'sell', 'sell'
-            else:
-                tp_side, sl_side = 'buy', 'buy'
+        # ============================================================
+        # PROTECCIONES SIMPLIFICADAS (PHASE 1) – USANDO FUNCIONES DEL POSITION MANAGER
+        # ============================================================
 
-            tp_resp = self.exchange.place_algo_order(
+        # 2. Take Profit (TP) – orden condicional con ordType="trigger"
+        if self.signal.target_price:
+            tp_side = "sell" if self.position.side == "long" else "buy"
+            tp_resp = self.exchange.place_conditional_order(
                 symbol=self.position.symbol,
                 side=tp_side,
+                size=self.position.size,
                 trigger_price=self.signal.target_price,
                 order_price=self.signal.target_price,
-                size=self.position.size,
-                order_type="conditional"
+                trigger_px_type="last",
+                pos_side=self.position.side
             )
-            sl_resp = self.exchange.place_algo_order(
-                symbol=self.position.symbol,
-                side=sl_side,
-                trigger_price=self.signal.stop_loss,
-                order_price=self.signal.stop_loss,
-                size=self.position.size,
-                order_type="conditional"
-            )
-
             if tp_resp.get('ok'):
-                telemetry.log_info("main", "TP enviado correctamente")
+                telemetry.log_info("main", "TP creado correctamente", tp_resp.get('data'))
             else:
-                telemetry.log_error("main", "Fallo al enviar TP", tp_resp)
+                telemetry.log_error("main", "Fallo al crear TP", tp_resp)
+        else:
+            telemetry.log_warning("main", "No se definió TP para esta señal")
 
-            if sl_resp.get('ok'):
-                telemetry.log_info("main", "SL enviado correctamente")
+        # 3. Trailing Stop – en lugar de SL fijo
+        if TRAILING_ENABLED and TRAILING_MODE == 'native':
+            trail_side = "sell" if self.position.side == "long" else "buy"
+            callback = TRAILING_DISTANCE_ATR * 0.01
+            telemetry.log_info("main", f"Creando Trailing Stop para {self.position.symbol} (callback={callback:.3f})")
+            trail_resp = self.exchange.place_trailing_order(
+                symbol=self.position.symbol,
+                side=trail_side,
+                size=self.position.size,
+                callback_ratio=callback,
+                trigger_px_type="last",
+                pos_side=self.position.side
+            )
+            if trail_resp.get('ok'):
+                telemetry.log_info("main", "Trailing Stop creado correctamente", trail_resp.get('data'))
             else:
-                telemetry.log_error("main", "Fallo al enviar SL", sl_resp)
+                telemetry.log_error("main", "Fallo al crear Trailing Stop", trail_resp)
+        else:
+            telemetry.log_warning("main", "Trailing Stop desactivado o modo no nativo – no se creó")
 
-            if TRAILING_ENABLED and TRAILING_MODE == 'native':
-                callback = TRAILING_DISTANCE_ATR * 0.01
-                trail_resp = self.exchange.place_trailing_order(
-                    symbol=self.position.symbol,
-                    side=tp_side,
-                    size=self.position.size,
-                    callback_rate=callback
-                )
-                if trail_resp.get('ok'):
-                    telemetry.log_info("main", "Trailing stop enviado correctamente")
-                else:
-                    telemetry.log_error("main", "Fallo al enviar trailing", trail_resp)
+        # NOTA: NO se crea SL fijo – el Trailing Stop actúa como única capa de stop-loss.
 
         # Guardar estado
         self.state_data['trades'].append({
@@ -370,7 +376,7 @@ class Bot:
             'side': self.position.side,
             'entry': self.position.entry_price,
             'tp': self.signal.target_price,
-            'sl': self.signal.stop_loss,
+            'trailing_callback': TRAILING_DISTANCE_ATR * 0.01 if TRAILING_ENABLED else None,
             'size': self.position.size,
             'notional': actual_notional,
             'leverage': LEVERAGE,
@@ -382,7 +388,6 @@ class Bot:
         self.state = BotState.WAIT_NEXT_CYCLE
 
     def _close_position(self):
-        """Cierra la posición actual (market order en contra)."""
         if self.position is None:
             return
         telemetry.log_info("main", f"Cerrando posición: {self.position.symbol} {self.position.side}")
