@@ -1,15 +1,24 @@
 # repair.py
 # ============================================================
-# REPARACIÓN DE PROTECCIONES
+# REPARACIÓN DE PROTECCIONES – SOLO TP Y TRAILING STOP (PHASE 1)
+# BASADO EN EL POSITION MANAGER PARA CONSISTENCIA DE API
 # ============================================================
 
 import traceback
-from config import TP_MULT, SL_MULT, MAX_REPAIR_ATTEMPTS
+from config import TP_MULT, SL_MULT, MAX_REPAIR_ATTEMPTS, TRAILING_ENABLED, TRAILING_MODE, TRAILING_DISTANCE_ATR
 from telemetry import telemetry
 
 def repair_protections(exchange, position):
+    """
+    Verifica que la posición tenga protecciones activas.
+    En Phase 1, solo se reparan:
+      - Take Profit (TP) si falta
+      - Trailing Stop (si está habilitado) si falta
+    NO se repara Stop Loss fijo.
+    Utiliza las mismas funciones que el Position Manager.
+    """
     telemetry.log_info("repair", f"Iniciando reparación para {position.symbol} (intento {position.repair_attempts+1}/{MAX_REPAIR_ATTEMPTS})")
-    result = {"tp": False, "sl": False, "trail": False, "error": None}
+    result = {"tp": False, "trailing": False, "error": None}
 
     if position.repair_attempts >= MAX_REPAIR_ATTEMPTS:
         msg = f"Límite de intentos de reparación alcanzado ({MAX_REPAIR_ATTEMPTS}) para {position.symbol}"
@@ -18,45 +27,93 @@ def repair_protections(exchange, position):
         return result
 
     try:
-        pending = exchange.get_pending_algo_orders(position.symbol)
+        # 1. Obtener órdenes algorítmicas pendientes
+        pending = exchange.get_pending_algo_orders(symbol=position.symbol)
         if not pending.get('ok'):
             telemetry.log_error("repair", "No se pudieron obtener órdenes pendientes", pending)
             result["error"] = pending.get("error", "Error desconocido")
             return result
 
         orders = pending.get('data', [])
-        has_tp = any(o.get('ordType') == 'conditional' and o.get('side') != position.side for o in orders)
-        has_sl = any(o.get('ordType') == 'conditional' and o.get('side') == position.side for o in orders)
 
+        # 2. Identificar protecciones existentes
+        has_tp = False
+        has_trailing = False
+        tp_algo_id = None
+        trailing_algo_id = None
+
+        for o in orders:
+            ord_type = o.get('ordType')
+            side = o.get('side')
+            # TP: side opuesto a la posición y ordType = "trigger" (o "conditional")
+            if ord_type in ['conditional', 'trigger']:
+                if position.side == 'long' and side == 'sell':
+                    has_tp = True
+                    tp_algo_id = o.get('algoId')
+                elif position.side == 'short' and side == 'buy':
+                    has_tp = True
+                    tp_algo_id = o.get('algoId')
+            # Trailing Stop
+            elif ord_type == 'move_order_stop':
+                has_trailing = True
+                trailing_algo_id = o.get('algoId')
+
+        # 3. Reparar TP si falta
         if not has_tp:
-            tp_price = position.entry_price * (1 + TP_MULT * (position.mark_price / position.entry_price - 1))
-            side = "sell" if position.side == "long" else "buy"
-            telemetry.log_info("repair", f"Creando TP a {tp_price:.2f}")
-            tp_resp = exchange.place_algo_order(position.symbol, side, tp_price, tp_price, position.size, "conditional")
+            telemetry.log_info("repair", "TP no encontrado, recreando...")
+            tp_side = "sell" if position.side == "long" else "buy"
+            # Calcular precio de TP basado en el precio de entrada y TP_MULT
+            if position.side == 'long':
+                tp_price = position.entry_price * (1 + TP_MULT * (position.mark_price / position.entry_price - 1))
+            else:
+                tp_price = position.entry_price * (1 - TP_MULT * (position.entry_price / position.mark_price - 1))
+
+            tp_resp = exchange.place_conditional_order(
+                symbol=position.symbol,
+                side=tp_side,
+                size=position.size,
+                trigger_price=tp_price,
+                order_price=tp_price,
+                trigger_px_type="last",
+                pos_side=position.side
+            )
             if tp_resp.get('ok'):
                 result['tp'] = True
-                telemetry.log_info("repair", "TP creado", {"order": tp_resp.get('data')})
+                telemetry.log_info("repair", "TP recreado correctamente", {"order": tp_resp.get('data')})
             else:
-                telemetry.log_error("repair", "Fallo al crear TP", tp_resp)
-                result["error"] = tp_resp.get("error", "Error creando TP")
+                telemetry.log_error("repair", "Fallo al recrear TP", tp_resp)
+                result["error"] = tp_resp.get("error", "Error recreando TP")
 
-        if not has_sl:
-            sl_price = position.entry_price * (1 - SL_MULT * (position.entry_price / position.mark_price - 1))
-            side = "sell" if position.side == "long" else "buy"
-            telemetry.log_info("repair", f"Creando SL a {sl_price:.2f}")
-            sl_resp = exchange.place_algo_order(position.symbol, side, sl_price, sl_price, position.size, "conditional")
-            if sl_resp.get('ok'):
-                result['sl'] = True
-                telemetry.log_info("repair", "SL creado", {"order": sl_resp.get('data')})
+        # 4. Reparar Trailing Stop si está habilitado y falta
+        if TRAILING_ENABLED and TRAILING_MODE == 'native':
+            if not has_trailing:
+                telemetry.log_info("repair", "Trailing Stop no encontrado, recreando...")
+                trail_side = "sell" if position.side == "long" else "buy"
+                callback = TRAILING_DISTANCE_ATR * 0.01
+                trail_resp = exchange.place_trailing_order(
+                    symbol=position.symbol,
+                    side=trail_side,
+                    size=position.size,
+                    callback_ratio=callback,
+                    trigger_px_type="last",
+                    pos_side=position.side
+                )
+                if trail_resp.get('ok'):
+                    result['trailing'] = True
+                    telemetry.log_info("repair", "Trailing Stop recreado correctamente", {"order": trail_resp.get('data')})
+                else:
+                    telemetry.log_error("repair", "Fallo al recrear Trailing Stop", trail_resp)
+                    if not result["error"]:
+                        result["error"] = trail_resp.get("error", "Error recreando Trailing")
             else:
-                telemetry.log_error("repair", "Fallo al crear SL", sl_resp)
-                if not result["error"]:
-                    result["error"] = sl_resp.get("error", "Error creando SL")
+                telemetry.log_debug("repair", "Trailing Stop ya existe, no se repara")
+        else:
+            telemetry.log_debug("repair", "Trailing Stop desactivado o modo no nativo – omitido")
 
         position.repair_attempts += 1
 
     except Exception as e:
-        telemetry.log_error("repair", f"Excepción: {e}", {"traceback": traceback.format_exc()})
+        telemetry.log_error("repair", f"Excepción en repair_protections: {e}", {"traceback": traceback.format_exc()})
         result["error"] = str(e)
 
     return result
