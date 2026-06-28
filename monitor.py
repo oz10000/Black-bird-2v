@@ -2,6 +2,7 @@
 # ============================================================
 # MONITOREO DE POSICIONES – VERSIÓN SIMPLIFICADA (PHASE 1)
 # BASADO EN EL POSITION MANAGER PARA CONSISTENCIA DE API
+# CORREGIDO: VERIFICACIÓN ADICIONAL DE EXISTENCIA DE POSICIÓN (B3)
 # ============================================================
 
 import time
@@ -19,6 +20,7 @@ def monitor_position(exchange, position):
     Monitorea una posición abierta y decide si debe cerrarse.
     En Phase 1, solo se gestionan TP y Trailing (sin SL fijo).
     Verifica la existencia de TP y Trailing usando las funciones del Position Manager.
+    🔧 CORRECCIÓN (B3): Verifica que la posición aún exista en OKX antes de tomar decisiones.
     """
     telemetry.log_info("monitor", f"Monitoreando {position.symbol}")
     result = {
@@ -30,6 +32,13 @@ def monitor_position(exchange, position):
     }
 
     try:
+        # 🔧 Verificar que la posición aún existe en OKX (B3)
+        fresh_pos = exchange.get_positions(symbol=position.symbol)
+        if not fresh_pos.get('ok') or not fresh_pos.get('data'):
+            telemetry.log_warning("monitor", f"Posición {position.symbol} ya no existe en OKX. Forzando limpieza de estado.")
+            result["force_clear"] = True
+            return result
+
         # 1. Obtener precio actual
         df = fetch_okx_candles(position.symbol, limit=1)
         if not df.empty:
