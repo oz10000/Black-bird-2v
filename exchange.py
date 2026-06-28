@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-exchange.py – Cliente OKX V5 (Futuros SWAP)
-Versión final consistente con Position Manager.
-Soporta firma con query string, attachAlgoOrds, todas las órdenes.
-"""
+# exchange.py
+# ============================================================
+# exchange.py – Cliente OKX V5 (Futuros SWAP)
+# Versión final consistente con Position Manager.
+# Soporta firma con query string, attachAlgoOrds, todas las órdenes.
+# ============================================================
 
 import time
 import json
