@@ -3,6 +3,7 @@
 # BOT PRINCIPAL – ORQUESTADOR CON SOPORTE MULTIESTRATEGIA
 # VERSIÓN OPTIMIZADA CON SISTEMA DE PROTECCIÓN SIMPLIFICADO (PHASE 1)
 # BASADO EN EL POSITION MANAGER PARA CONSISTENCIA DE API
+# CORREGIDO: DESINCRONIZACIÓN DE POSICIÓN (B1)
 # ============================================================
 
 import os
@@ -17,7 +18,7 @@ import numpy as np
 
 from config import *
 from telemetry import telemetry
-from exchange import Exchange
+from exchange import Exchange  # Usamos el mismo Exchange que el Position Manager
 from strategy import get_best_signal
 from monitor import monitor_position
 from repair import repair_protections
@@ -388,6 +389,10 @@ class Bot:
         self.state = BotState.WAIT_NEXT_CYCLE
 
     def _close_position(self):
+        """
+        Cierra la posición actual con una orden de mercado en sentido contrario.
+        🔧 CORRECCIÓN (B1): self.position se limpia SIEMPRE, incluso si la orden falla.
+        """
         if self.position is None:
             return
         telemetry.log_info("main", f"Cerrando posición: {self.position.symbol} {self.position.side}")
@@ -395,10 +400,13 @@ class Bot:
         close_resp = self.exchange.place_market_order(self.position.symbol, side, self.position.size)
         if close_resp.get('ok'):
             telemetry.log_info("main", "Posición cerrada exitosamente", close_resp)
-            self.position = None
         else:
             telemetry.log_error("main", "Fallo al cerrar posición", close_resp)
             self.state = BotState.ERROR_RECOVERY
+
+        # 🔧 FIX: Limpiar el estado de posición SIEMPRE, incluso si la orden falla
+        # Esto evita desincronización entre el bot y OKX.
+        self.position = None
 
     def _wait_next_cycle(self):
         telemetry.log_info("main", "Esperando siguiente ciclo...")
