@@ -2,6 +2,7 @@
 # ============================================================
 # REPARACIÓN DE PROTECCIONES – SOLO TP Y TRAILING STOP (PHASE 1)
 # BASADO EN EL POSITION MANAGER PARA CONSISTENCIA DE API
+# CORREGIDO: VERIFICACIÓN DE EXISTENCIA DE POSICIÓN (B2)
 # ============================================================
 
 import traceback
@@ -16,9 +17,17 @@ def repair_protections(exchange, position):
       - Trailing Stop (si está habilitado) si falta
     NO se repara Stop Loss fijo.
     Utiliza las mismas funciones que el Position Manager.
+    🔧 CORRECCIÓN (B2): Verifica que la posición aún exista en OKX antes de reparar.
     """
     telemetry.log_info("repair", f"Iniciando reparación para {position.symbol} (intento {position.repair_attempts+1}/{MAX_REPAIR_ATTEMPTS})")
     result = {"tp": False, "trailing": False, "error": None}
+
+    # 🔧 Verificar que la posición aún existe en OKX
+    pos_check = exchange.get_positions(symbol=position.symbol)
+    if not pos_check.get('ok') or not pos_check.get('data'):
+        telemetry.log_warning("repair", f"Posición {position.symbol} ya no existe en OKX. Saltando reparación.")
+        result["error"] = "Position no longer exists"
+        return result
 
     if position.repair_attempts >= MAX_REPAIR_ATTEMPTS:
         msg = f"Límite de intentos de reparación alcanzado ({MAX_REPAIR_ATTEMPTS}) para {position.symbol}"
